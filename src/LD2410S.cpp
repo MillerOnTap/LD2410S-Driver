@@ -796,6 +796,21 @@ bool LD2410S::wasUpdatedAndClear() {
     return u;
 }
 
+/** @brief Return the latest timestamp in milliseconds */
+uint32_t LD2410S::latestTimestamp() const {
+    return _latest.ts_ms;
+}
+
+/** @brief Return the latest distance in centimeters */
+uint32_t LD2410S::latestDistanceCm() const {
+    return _latest.distance_cm;
+}
+
+/** @brief Return the latest motion detection status */
+bool LD2410S::latestMotionDetected() const {
+    return _latest.motion;
+}
+
 /** @brief Return the latest distance in meters */
 float LD2410S::latestDistanceMeters() const {
     return _latest.distance_cm / 100.0f;

@@ -312,6 +312,15 @@ public:
      */
     bool getLatest(LD2410SEvent& out) const;  
 
+    /** @brief Return the latest timestamp in milliseconds */
+    uint32_t latestTimestamp() const;
+
+    /** @brief Return the latest distance in centimeters */
+    uint32_t latestDistanceCm() const;
+
+    /** @brief Return the latest motion detection status */
+    bool latestMotionDetected() const;
+
     /**
      * @brief Checks if the latest data has been updated then clears the flag.
      * @return true if the latest data has been updated
