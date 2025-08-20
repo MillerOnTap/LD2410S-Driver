@@ -30,6 +30,10 @@ Configuration coverage expanded: High-level helpers for reading/writing common p
 
 Retries & validation: All commands now support retries, timeouts, and strict ACK matching (with optional payload copy), improving reliability vs. fixed delays.
 
+Added Standard Data Mode.
+
+All published funtions of the LD2410S have been implemented.
+
 Diagnostics & logging: Bounded hex dumps (dumpFrame()), human-readable payload printing, ASCII and version decoders, and a parseLEUint32() utility promoted to a class member.
 
 Backward compatibility: Core ops retained (enter/exitConfigMode, switchToMinimal/StandardMode, readFirmwareVersion, readSerialNumber) but implementations are stricter and non-blocking.
