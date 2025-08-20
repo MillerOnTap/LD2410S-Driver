@@ -20,6 +20,7 @@
 
 #pragma once
 #include <Arduino.h>
+#include <atomic>
 
 /**
  * @def LD2410S_ENABLE_LOG
@@ -42,13 +43,9 @@ namespace {
   static const uint8_t DATA_TAIL[4] = {0xF8, 0xF7, 0xF6, 0xF5};
 }
 
-struct LD2410SEvent {
-    bool motion;           // true=motion (target_state 2/3), false=none (0/1)
-    uint16_t distance_cm;  // raw cm from frame
-    uint32_t ts_ms;        // millis() when parsed
-};
 
-using LD2410SCallback = void(*)(const LD2410SEvent&);
+
+
 
 /**
  * @class LD2410S
@@ -69,6 +66,34 @@ public:
      */
     ~LD2410S();
 
+    struct MinimalData {
+      uint8_t  target_state = 0;
+      uint16_t distance_cm = 0;
+      uint32_t seq = 0;  
+      uint64_t ts_ms = 0;       
+      bool motion = false;
+    };
+
+    struct ProgressData {
+      uint8_t  percent = 0;      
+      uint32_t seq = 0;
+      uint64_t ts_ms = 0;
+    };
+
+    struct StandardData {
+      uint8_t  target_state = 0;
+      uint16_t distance_cm = 0;
+      uint16_t reserved = 0;
+      uint32_t energy[16] = {0}; 
+
+      // Derived values, not directly reported from sensor
+      uint32_t noise[16] = {0}; // EMA in (raw units)
+      int16_t snr_db_q8[16] = {0}; //SNR in db * 256 (fixed-point)
+      uint32_t seq = 0; //Updated every new frame
+      uint64_t ts_ms = 0; // Timestamp in milliseconds
+      bool motion = false; // True if motion detected
+    };
+
     /**
      * @brief a Structure for the Auto configuration parameters
      */
@@ -77,6 +102,7 @@ public:
         uint16_t retention = 1;
         uint16_t scanTime = 0x0078;
     };
+
 
     /*
      * @brief Set default Auto Configuration parameters
@@ -306,28 +332,112 @@ public:
     /** @brief Get the latest distance in feet */
     float latestDistanceFeet()   const;
 
-    /**
-     * @brief Fill Event Structure with the latest data
-     * @param out Event structure to be filled
-     */
-    bool getLatest(LD2410SEvent& out) const;  
-
-    /** @brief Return the latest timestamp in milliseconds */
+      /** @brief Return the latest timestamp in milliseconds */
     uint32_t latestTimestamp() const;
 
-    /** @brief Return the latest distance in centimeters */
+        /** @brief Return the latest distance in centimeters */
     uint32_t latestDistanceCm() const;
 
     /** @brief Return the latest motion detection status */
     bool latestMotionDetected() const;
 
-    /**
-     * @brief Checks if the latest data has been updated then clears the flag.
-     * @return true if the latest data has been updated
-     */
-    bool wasUpdatedAndClear();          
+    /** @brief Return the latest target state */
+    uint8_t latestTargetState() const;
 
-     /**
+    /** @brief Get the latest minimal data motion information
+     * @param motion Reference to a boolean variable to store the motion status
+     * @param dist Reference to a uint16_t variable to store the distance
+     * @param seqOut Pointer to a uint32_t variable to store the sequence number
+     * @param tsOut Pointer to a uint64_t variable to store the timestamp
+     */
+    bool getMinimalData(bool& motion, uint8_t& target_state, uint16_t& dist, uint32_t* seqOut, uint64_t* tsOut) const;
+
+    /**
+     * @brief Get the latest minimal data
+     * @param out Reference to a MinimalData structure to store the data
+     * @return true if successful
+     */
+    bool getMinimalData(MinimalData& out) const {
+      for (int tries = 0; tries < 2; ++tries) {
+        uint32_t a = _minSeq.load(std::memory_order_acquire);
+        if (a & 1) continue;                // writer in progress
+        out = _minData;                          
+        std::atomic_thread_fence(std::memory_order_acquire);
+        uint32_t b = _minSeq.load(std::memory_order_acquire);
+        if (a == b) return true;            
+      }
+      return false;                          
+    }
+
+    /**
+     * @brief Get the latest standard data
+     * @param motion Reference to a boolean variable to store the motion status
+     * @param dist Reference to a uint16_t variable to store the distance
+     * @param reserved Reference to a uint16_t variable to store the reserved value
+     * @param energy Array to store the 16 measure gate energy levels
+     * @param seqOut Pointer to a uint32_t variable to store the sequence number
+     * @param tsOut Pointer to a uint64_t variable to store the timestamp
+     * @param noise Array to store the 16 measure gate noise levels
+     * @param snr Array to store the 16 measure gate SNR values
+     * @return true if successful
+     */
+    bool getStandardData(bool& motion, uint8_t& target_state, uint16_t& dist,
+                                  uint16_t& reserved, uint32_t energy[16],
+                                  uint32_t* seqOut, uint64_t* tsOut, uint32_t noise[16], uint16_t snr[16]) const;
+
+    /**
+     * @brief Get the latest standard data
+     * @param out Reference to a StandardData structure to store the data
+     * @return true if successful
+     */                                  
+    bool getStandardData(StandardData& out) const {
+      for (int tries = 0; tries < 2; ++tries) {
+        uint32_t a = _stdSeq.load(std::memory_order_acquire);
+        if (a & 1) continue;                
+        out = _stdData;                          
+        std::atomic_thread_fence(std::memory_order_acquire);
+        uint32_t b = _stdSeq.load(std::memory_order_acquire);
+        if (a == b) return true;
+      }
+      return false;                          
+  }
+
+    /**
+     * @brief Get the latest progress data
+     * @param pct Reference to a uint8_t variable to store the progress percentage
+     * @param seqOut Pointer to a uint32_t variable to store the sequence number
+     * @param tsOut Pointer to a uint64_t variable to store the timestamp
+     * @return true if successful
+     */
+    bool getProgressData(uint8_t& pct, uint32_t* seqOut, uint64_t* tsOut) const;
+
+    /**
+     * @brief Reset the noise data
+     * @note This will zero out the noise data and re-prime it
+     */
+    void resetNoise() {
+      memset(_stdData.noise, 0, sizeof(_stdData.noise));
+      _noisePrimed = false;
+    }
+
+    /**
+     * @brief Set the noise EMA alpha value
+     * @param a_q8 Alpha value in Q8 format (default ~16 (≈0.0625))
+     */
+    void setNoiseEmaAlphaQ8(uint8_t a_q8 = 16) {
+      _noise_alpha_q8 = a_q8;
+    }
+
+    /**
+     * @brief Set this to true if you want noise also updated during motion
+     * otherwise it will only be updated when no motion is detected
+     * @param enable True to enable updates on motion, false to disable
+     */
+    void setNoiseUpdateOnMotion(bool enable = false) {
+        _noise_update_on_motion = enable;
+    }
+
+    /**
      * @brief Get the last frame information
      * @param cmdMaj Major command byte
      * @param cmdMin Minor command byte
@@ -412,11 +522,10 @@ public:
     
     /**
      * @brief Main loop to process incoming data
-     * @param max_bytes_per_call Maximum number of bytes to read per call (default = 128)
+     * @note Call this often so incoming data is sent to the correct parsers
+     * 
      */
-    void loop(size_t max_bytes_per_call = 128);
-
-    void onEvent(LD2410SCallback cb) { _cb = cb; }
+    void loop();
 
     
 private:
@@ -461,8 +570,20 @@ private:
      */
     static bool decodeVersion4B(const uint8_t* p, uint16_t len, String &out);
 
-    bool parseMinimalFrame(const uint8_t* frame, size_t len, LD2410SEvent& out);
+    /**
+     * @brief Parse a minimal frame
+     * @param frame Pointer to the frame data
+     * @param len Length of the frame data
+     * @param out Structure to fill with the parsed event data
+     * @return true if successful
+     */
+    bool parseMinimalFrame(const uint8_t* frame, size_t len);
 
+    /**
+     * @brief Dump a frame for debugging
+     * @param p Pointer to the data
+     * @param n Length of the data
+     */
     void dumpFrame(const uint8_t* p, size_t n);
 
     /**
@@ -475,6 +596,17 @@ private:
      * @return The parsed 32-bit unsigned integer.
      */
     static uint32_t parseLEUint32(const uint8_t *data);
+
+    void parseProgressFrame(const uint8_t* frame, uint16_t len);
+
+    void parseStandardFrame(const uint8_t* frame, uint16_t len);
+
+    void primeNoiseIfNeeded(const uint32_t e[16]) {
+      if (!_noisePrimed) {
+          memcpy(_stdData.noise, e, 16 * sizeof(uint32_t));
+          _noisePrimed = true;
+        }
+      }
 
     HardwareSerial &_serial; 
 
@@ -504,9 +636,7 @@ private:
   uint16_t _lastPayloadLen = 0;
   uint8_t  _lastPayload[120];
   
-
-  // Data channel parser (F4 F3 F2 F1 ... F8 F7 F6 F5)
-    enum class DState : uint8_t { 
+  enum class DState : uint8_t { 
       D_FIND_HDR, 
       D_LEN0, 
       D_LEN1, 
@@ -543,7 +673,44 @@ private:
   bool    _inFrame = false;
   uint32_t _lastByteMs = 0;
 
-  LD2410SEvent _latest{false, 0, 0};
-  mutable volatile bool _updated = false;
-  LD2410SCallback _cb = nullptr;
+ 
+  uint8_t  _noise_alpha_q8 = 16; // ≈0.0625
+  bool     _noise_update_on_motion = false;
+  bool     _noisePrimed = false;
+  std::atomic<uint32_t> _stdSeq{0}; 
+  std::atomic<uint32_t> _minSeq{0}; // even=stable, odd=being written
+
+
+enum class OutputMode : uint8_t { 
+  Unknown, 
+  Minimal, 
+  Standard 
 };
+
+OutputMode _outMode = OutputMode::Unknown;
+
+enum class MState : uint8_t { 
+  FIND_HDR, 
+  PAYLOAD 
+}; 
+MState  _mst   = MState::FIND_HDR;
+uint8_t _mbuf[5];
+uint8_t _mpos  = 0;
+
+MinimalData  _minData{};
+ProgressData _progData{};
+StandardData _stdData{};
+
+};
+
+static inline uint32_t emaU32(uint32_t oldv, uint32_t newv, uint8_t a_q8){
+  return oldv + ((int32_t(newv) - int32_t(oldv)) * a_q8 >> 8);
+}
+
+static inline int16_t dbToQ8(float db){        // dB -> Q8
+  float x = db * 256.0f;
+  if (x < -32768.0f) x = -32768.0f;
+  if (x >  32767.0f) x =  32767.0f;
+  return (int16_t)x;
+}
+
