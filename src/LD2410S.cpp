@@ -68,7 +68,8 @@ bool LD2410S::switchToMinimalMode(size_t retries, uint32_t timeoutMs)
         return false;
     }
 
-    
+    _outMode = OutputMode::Minimal;
+
     return true;
 }
 
@@ -110,6 +111,8 @@ bool LD2410S::switchToStandardMode(size_t retries, uint32_t timeoutMs)
         LD2410S_LOG("Error: Unexpected response for switch to standard mode ACK: %20X %20X", buf[0], buf[1]);
         return false;
     }
+
+    _outMode = OutputMode::Standard;
 
     return true;
 }
@@ -777,48 +780,87 @@ bool LD2410S::readHoldThresholds(uint32_t* gateThresholds, size_t len, size_t re
 }
 
 
-/**
- * @brief Fill Event Structure with the latest data
- * @param out Event structure to be filled
- */
-bool LD2410S::getLatest(LD2410SEvent& out) const {
-    out = _latest; // POD copy
-    return true;
-}
-
-/**
- * @brief Checks if the latest data has been updated then clears the flag.
- * @return true if the latest data has been updated
- */
-bool LD2410S::wasUpdatedAndClear() {
-    bool u = _updated;
-    _updated = false;
-    return u;
-}
-
 /** @brief Return the latest timestamp in milliseconds */
 uint32_t LD2410S::latestTimestamp() const {
-    return _latest.ts_ms;
-}
-
-/** @brief Return the latest distance in centimeters */
-uint32_t LD2410S::latestDistanceCm() const {
-    return _latest.distance_cm;
+    return _minData.ts_ms;
 }
 
 /** @brief Return the latest motion detection status */
 bool LD2410S::latestMotionDetected() const {
-    return _latest.motion;
+    return _minData.motion;
+}
+
+uint8_t LD2410S::latestTargetState() const {
+    return _minData.target_state;
+} 
+
+/** @brief Return the latest distance in centimeters */
+uint32_t LD2410S::latestDistanceCm() const {
+    return _minData.distance_cm;
 }
 
 /** @brief Return the latest distance in meters */
 float LD2410S::latestDistanceMeters() const {
-    return _latest.distance_cm / 100.0f;
+    return _minData.distance_cm / 100.0f;
 }
 
 /** @brief Return the latest distance in feet */
 float LD2410S::latestDistanceFeet() const {
-    return _latest.distance_cm * 0.0328084f;
+    return _minData.distance_cm * 0.0328084f;
+}
+
+/** @brief Get the latest minimal data motion information
+ * @param motion Reference to a boolean variable to store the motion status
+ * @param dist Reference to a uint16_t variable to store the distance
+ * @param seqOut Pointer to a uint32_t variable to store the sequence number
+ * @param tsOut Pointer to a uint64_t variable to store the timestamp
+ */
+bool LD2410S::getMinimalData(bool& motion, uint8_t& target_state, uint16_t& dist, uint32_t* seqOut, uint64_t* tsOut) const {
+  motion = _minData.motion;
+  target_state = _minData.target_state;
+  dist   = _minData.distance_cm;
+  if (seqOut) *seqOut = _minData.seq;
+  if (tsOut) *tsOut = _minData.ts_ms;
+  return true;
+}
+
+/**
+ * @brief Get the latest standard data
+ * @param motion Reference to a boolean variable to store the motion status
+ * @param dist Reference to a uint16_t variable to store the distance
+ * @param reserved Reference to a uint16_t variable to store the reserved value
+ * @param energy Array to store the 16 measure gate energy levels
+ * @param seqOut Pointer to a uint32_t variable to store the sequence number
+ * @param tsOut Pointer to a uint64_t variable to store the timestamp
+ * @return true if successful
+ */
+bool LD2410S::getStandardData(bool& motion, uint8_t& target_state, uint16_t& dist,
+                                  uint16_t& reserved, uint32_t energy[16],
+                                  uint32_t* seqOut, uint64_t* tsOut, uint32_t noise[16], uint16_t snr[16]) const {
+  motion   = _stdData.motion;
+  target_state = _stdData.target_state;
+  dist     = _stdData.distance_cm;
+  reserved = _stdData.reserved;
+  if (energy) memcpy(energy, _stdData.energy, sizeof(_stdData.energy));
+  if (seqOut) *seqOut = _stdData.seq;
+  if (tsOut) *tsOut = _stdData.ts_ms;
+  if (noise) memcpy(noise, _stdData.noise, sizeof(_stdData.noise));
+  if (snr) memcpy(snr, _stdData.snr_db_q8, sizeof(_stdData.snr_db_q8));
+  return true;
+}
+
+/**
+ * @brief Get the latest progress data
+ * @param pct Reference to a uint8_t variable to store the progress percentage
+ * @param seqOut Pointer to a uint32_t variable to store the sequence number
+ * @param tsOut Pointer to a uint64_t variable to store the timestamp
+ * @return true if successful
+ */
+bool LD2410S::getProgressData(uint8_t& pct, uint32_t* seqOut, uint64_t* tsOut) const {
+  pct = _progData.percent;
+  if (seqOut) *seqOut = _progData.seq;
+  if (tsOut) *tsOut = _progData.ts_ms;
+  return true;
 }
 
 /**
@@ -1073,6 +1115,7 @@ void LD2410S::feed(uint8_t b) {
  * @param b The byte to feed.
  */
 void LD2410S::feedData(uint8_t b) {
+  // ---- Standard/progress DATA parser (unchanged) ----
   switch (_dst) {
     case DState::D_FIND_HDR:
       if (b == DATA_HDR[_dhdrIdx]) { if (++_dhdrIdx == 4) { _dhdrIdx = 0; _dst = DState::D_LEN0; } }
@@ -1083,17 +1126,25 @@ void LD2410S::feedData(uint8_t b) {
     case DState::D_LEN1: _dneed |= (uint16_t)b << 8; _dbi = 0; _dst = DState::D_BODY; break;
 
     case DState::D_BODY:
-        if (_dbi < sizeof(_dbody)) _dbody[_dbi] = b;   // store while we have room
-        ++_dbi;                                      // ALWAYS count the byte
-        if (_dbi >= _dneed) { _dtailIdx = 0; _dst = DState::D_TAIL; }
-        break;
+      if (_dbi < sizeof(_dbody)) _dbody[_dbi++] = b;
+      if (_dbi >= _dneed) { _dtailIdx = 0; _dst = DState::D_TAIL; }
+      break;
 
     case DState::D_TAIL:
       if (b == DATA_TAIL[_dtailIdx]) {
         if (++_dtailIdx == 4) {
-          _dataLen = (_dneed > sizeof(_dataBody)) ? sizeof(_dataBody) : _dneed;
-          memcpy(_dataBody, _dbody, _dataLen);
-          _dataReady = true;
+          const uint16_t n = (_dneed > sizeof(_dataBody)) ? sizeof(_dataBody) : _dneed;
+          memcpy(_dataBody, _dbody, n);
+          _dataLen = n;
+
+          // Dispatch immediately: type is at _dataBody[0]
+          if (_dataLen >= 1) {
+            const uint8_t type = _dataBody[0];
+            if (type == 0x01)      { parseStandardFrame(_dataBody, _dataLen); _outMode = OutputMode::Standard; }
+            else if (type == 0x03) { parseProgressFrame(_dataBody, _dataLen); }
+            // else: unknown data type -> ignore
+          }
+
           _dst = DState::D_FIND_HDR; _dhdrIdx = 0; _dtailIdx = 0; _dneed = 0; _dbi = 0;
         }
       } else {
@@ -1101,62 +1152,118 @@ void LD2410S::feedData(uint8_t b) {
       }
       break;
   }
+
+  // ---- Minimal-mode parser: 6E [state] [distLE2] 62 ----
+  // Only try to parse in Minimal/Unknown to avoid false positives
+  if (_outMode != OutputMode::Standard) {
+    switch (_mst) {
+      case MState::FIND_HDR:
+        if (b == 0x6E) { _mbuf[0] = 0x6E; _mpos = 1; _mst = MState::PAYLOAD; }
+        break;
+
+      case MState::PAYLOAD:
+        if (_mpos < 5) _mbuf[_mpos++] = b;
+        if (_mpos == 5) {
+          // We have 5 bytes: 6E, state, dist_lo, dist_hi, 62
+          if (_mbuf[4] == 0x62) {
+            // Plausibility check: state 0..3 only
+            uint8_t st = _mbuf[1];
+            if (st <= 3) {
+              // Directly update caches (and also backfill standard basics)
+              parseMinimalFrame(_mbuf, 5);
+              if (_outMode == OutputMode::Unknown) _outMode = OutputMode::Minimal;
+            }
+          }
+          _mst = MState::FIND_HDR; _mpos = 0;
+        }
+        break;
+    }
+  }
 }
+
 
 /**
  * @brief Main loop to process incoming data
- * @param max_bytes_per_call Maximum number of bytes to read per call (default = 128)
  */
-void LD2410S::loop(size_t max_bytes_per_call) {
-    size_t consumed = 0;
-    const uint32_t now = millis();
-
-    // Timeout: if we're mid-frame and it went quiet, reset
-    if (_inFrame && (now - _lastByteMs) > FRAME_IDLE_TIMEOUT_MS) {
-        _inFrame = false;
-        _pos = 0;
-    }
-
-    while (_serial.available() && consumed < max_bytes_per_call) {
-        uint8_t b = _serial.read();
-        consumed++;
-        _lastByteMs = now;
-
-        if (!_inFrame) {
-            if (b == HDR) {
-                _inFrame = true;
-                _pos = 0;
-                _buf[_pos++] = b;
-            }
-            // else keep scanning for header
-        } else {
-            // In frame
-            if (_pos < MAX_FRAME) {
-                _buf[_pos++] = b;
-            } else {
-                // overflow: resync by treating this byte as potential new header
-                _inFrame = (b == HDR);
-                _pos = _inFrame ? ( _buf[0] = b, 1 ) : 0;
-                continue;
-            }
-            if (b == FTR || _pos >= MAX_FRAME) {
-                LD2410S_LOG_LINE("Minimal frame:");
-                dumpFrame(_buf, _pos);
-
-                LD2410SEvent evt;
-                if (parseMinimalFrame(_buf, _pos, evt)) {
-                    _latest = evt;
-                    _updated = true;
-                    if (_cb) _cb(evt);
-                }
-                // Resync: if last byte looked like header, keep it as start
-                bool carryHeader = (_buf[_pos-1] == HDR);
-                _inFrame = carryHeader;
-                _pos = carryHeader ? ( _buf[0] = HDR, 1 ) : 0;
-            }
-        }
-    }
+ void LD2410S::loop() {
+  while (_serial.available()) {
+    uint8_t b = (uint8_t)_serial.read();
+    feed(b);       // command/ACK channel
+    feedData(b);   // data channel (standard/progress + minimal)
+  }
 }
+
+
+/**
+ * @brief Parse a progress frame from the LD2410S
+ * @param frame Pointer to the frame data.
+ * @param len Length of the frame data.
+ */
+void LD2410S::parseProgressFrame(const uint8_t* frame, uint16_t len) {
+  // Expect at least [type=0x03, pct]
+  if (len < 2) return;
+  uint8_t pct = frame[1];
+  if (pct > 100) pct = 100;
+  _progData.percent = pct;
+  ++_progData.seq;
+  _progData.ts_ms = millis();
+}
+
+void LD2410S::parseStandardFrame(const uint8_t* p, uint16_t n) {
+  if (n < 70 || p[0] != 0x01) return;
+
+  const uint8_t  state       = p[1];
+  const uint16_t distance_cm = (uint16_t)p[2] | ((uint16_t)p[3] << 8);
+  const uint16_t reserved    = (uint16_t)p[4] | ((uint16_t)p[5] << 8);
+
+  // Energy block starts at p[6], 16 * 4 bytes (LE)
+  const uint8_t* e = &p[6];
+  for (int i = 0; i < 16; ++i) {
+    _stdData.energy[i] = (uint32_t)e[0] |
+                         ((uint32_t)e[1] << 8) |
+                         ((uint32_t)e[2] << 16) |
+                         ((uint32_t)e[3] << 24);
+    e += 4;
+  }
+
+  const bool motion = (state == 2 || state == 3);
+
+  // 1) noise update (by default only when no person)
+  const bool allow_update = _noise_update_on_motion || (state <= 1);
+  if (allow_update) primeNoiseIfNeeded(_stdData.energy);
+  for (int i=0;i<16;++i){
+    if (allow_update){
+      _stdData.noise[i] = emaU32(_stdData.noise[i], _stdData.energy[i], _noise_alpha_q8);
+    }
+    // clamp noise ≥1 to stay well-defined
+    uint32_t n = _stdData.noise[i] ? _stdData.noise[i] : 1;
+    uint32_t e = _stdData.energy[i] > n ? _stdData.energy[i] : (n+1);
+
+    // SNR(dB) = 10*log10(e/n). ESP32 etc. have FPU; fine to use log10f.
+    float snr_db = 10.0f * log10f((float)e / (float)n);
+    if (snr_db < 0.0f) snr_db = 0.0f;      // UI-friendly floor
+    if (snr_db > 96.0f) snr_db = 96.0f;    // sane ceiling
+    _stdData.snr_db_q8[i] = dbToQ8(snr_db);
+  }
+
+  // Update standard struct
+  _stdData.motion      = motion;
+  _stdData.target_state = state;
+  _stdData.distance_cm = distance_cm;
+  _stdData.reserved    = reserved;
+  _stdData.ts_ms       = millis();
+  ++_stdData.seq;
+
+  // Also refresh minimal fields so readers of “minimal” are never stale
+  _minData.motion      = motion;
+  _minData.target_state = state;
+  _minData.distance_cm = distance_cm;
+  _minData.ts_ms       = millis();
+  ++_minData.seq;
+
+  ++_stdSeq;
+}
+
 
 /**
  * @brief Parser used for parsing the minimal frame format from the LD2410S
@@ -1164,7 +1271,7 @@ void LD2410S::loop(size_t max_bytes_per_call) {
  * @param len Length of the frame data.
  * @param out Reference to the output event structure.
  */
-bool LD2410S::parseMinimalFrame(const uint8_t* frame, size_t len, LD2410SEvent& out) {
+bool LD2410S::parseMinimalFrame(const uint8_t* frame, size_t len) {
     if (len < MIN_FRAME) return false;
     if (frame[0] != HDR)  return false;
     if (frame[len-1] != FTR) return false;
@@ -1177,9 +1284,12 @@ bool LD2410S::parseMinimalFrame(const uint8_t* frame, size_t len, LD2410SEvent& 
 
     uint16_t dist = (uint16_t(frame[3]) << 8) | frame[2];
 
-    out.motion = motion;
-    out.distance_cm = dist;
-    out.ts_ms = millis();
+    _minData.motion = motion;
+    _minData.target_state = target;
+    _minData.distance_cm = dist;
+    _minData.ts_ms = millis();
+    ++_minData.seq;
+    ++_minSeq;
     return true;
 }
 

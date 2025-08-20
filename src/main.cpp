@@ -32,7 +32,17 @@ uint32_t freqStatus = 0;
 uint32_t freqDistance = 0;
 uint32_t responseTime = 0;
 
-LD2410SEvent event;
+//motion variables
+bool motionDetected = false;
+uint16_t motionDistance = 0;
+uint32_t motionSeq = 0;
+uint64_t motionTs = 0;
+uint16_t reserved = 0;
+uint32_t gatesEnergy[16] = {0};
+
+uint8_t progress = 0;
+
+LD2410S::StandardData data;
 
 // Timing variables
 unsigned long lastStatusMillis = 0;
@@ -168,7 +178,7 @@ void setup() {
     32, 32, 32, 32,
     32, 32, 32, 32
   };
-  if (ld2410s.writeTriggerThresholds(triggerOut, sizeof(triggerOut)/sizeof(triggerOut[0]), 5, 1000)) {
+  if (ld2410s.writeTriggerThresholds(triggers, sizeof(triggers)/sizeof(triggers[0]), 5, 1000)) {
     Serial.println("Trigger threshold written successfully");
   } else {
     Serial.println("Failed to write trigger threshold");
@@ -180,7 +190,7 @@ void setup() {
     31, 31, 31, 31,
     31, 31, 31, 31
   };
-  if (ld2410s.writeHoldThresholds(holdOut, sizeof(holdOut)/sizeof(holdOut[0]), 5, 1000)) {
+  if (ld2410s.writeHoldThresholds(hold, sizeof(hold)/sizeof(hold[0]), 5, 1000)) {
     Serial.println("Hold threshold written successfully");
   } else {
     Serial.println("Failed to write hold threshold");
@@ -208,22 +218,23 @@ void setup() {
     delay(250);
     Serial.println("Starting auto update threshold command in 10 seconds, leave room for 4 minutes...");
     delay(10000);
-    if (ld2410s.autoUpdateThresholds(2,1,240,4,1000)) {
+    if (ld2410s.autoUpdateThresholds(2,1,120,4,1000)) {
       delay(250);
       ld2410s.exitConfigMode();
       int failCount = 0;
       for (;;) {
-        uint32_t p = ld2410s.autoUpdateProgress(1500); // waits up to 1.5s for next progress frame
-        if (p == UINT32_MAX) {
+        ld2410s.loop();
+        ld2410s.getProgressData(progress, &motionSeq, &motionTs);
+        if (progress == 0) {
           Serial.println("No progress frame yet...");
           if (++failCount >= 10) {
             Serial.println("Auto-config progress failed after 10 attempts, exiting...");
             break;
           }
-          failCount++;
-        } else {    
-          printProgressBar(p);
-          if (p >= 100) {
+          delay(1000);
+          } else {    
+          printProgressBar(progress);
+          if (progress >= 100) {
             Serial.println("Auto-config complete!");
             break;
           }
@@ -261,10 +272,10 @@ void setup() {
       Serial.println("Failed to read hold threshold");
     }
    delay(250);
-  if (ld2410s.switchToMinimalMode()) {
-    Serial.println("Switched to minimal mode successfully");
+  if (ld2410s.switchToStandardMode()) {
+    Serial.println("Switched to standard mode successfully");
   } else {
-    Serial.println("Failed to switch to minimal mode");
+    Serial.println("Failed to switch to standard mode");
   }
   delay(250);
   if (ld2410s.exitConfigMode())
@@ -276,12 +287,32 @@ void setup() {
 }
 
 void loop() {
-  ld2410s.loop();  
-  ld2410s.getLatest(event);
-  //Print status every second
-  if (millis() - lastStatusMillis >= 1000) {
-    Serial.printf("Target Distance: %.2f feet, (%d cm)\n", ld2410s.latestDistanceFeet(), event.distance_cm);
-    Serial.println(event.motion ? "Motion" : "Static");
-    lastStatusMillis = millis();
-  }
+  ld2410s.loop();    
+  
+    //Print status every second
+    if (millis() - lastStatusMillis >= 1000) {
+      if (ld2410s.getStandardData(data)) {
+        Serial.printf("-------------------------------------------------------------------------------------------\n");
+        Serial.printf("Target Distance: %.2f feet, (%d cm), Sequence Number: %d, State: %d\n", ld2410s.latestDistanceFeet(), data.distance_cm, data.seq, data.target_state);
+        Serial.printf("Gates Energy: ");
+        for (int i = 0; i < 16; i++) {
+          Serial.print(data.energy[i]);
+          Serial.print(" ");
+          }
+          Serial.println();
+          Serial.printf("Gates Noise: ");
+          for (int i = 0; i < 16; i++) {
+            Serial.print(data.noise[i]);
+            Serial.print(" ");
+          }
+          Serial.println();
+          Serial.printf("Gates SNR: ");
+          for (int i = 0; i < 16; i++) {
+            Serial.printf("%.2f", data.snr_db_q8[i] / 256.0);
+            Serial.print(" ");
+          }
+          Serial.println();
+          lastStatusMillis = millis();
+      }
+    }
 }
